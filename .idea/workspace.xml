@@ -4,16 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="329fa9e5-44a8-417a-9e59-78d39b36ad50" name="Changes" comment="...">
-      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/laboratory/generate_data_for_PINN.py" beforeDir="false" afterPath="$PROJECT_DIR$/laboratory/generate_data_for_PINN.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/laboratory/v_dot_parameter_sweep_1D.py" beforeDir="false" afterPath="$PROJECT_DIR$/laboratory/v_dot_parameter_sweep_1D.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/laboratory/v_dot_parameter_sweep_2D.py" beforeDir="false" afterPath="$PROJECT_DIR$/laboratory/v_dot_parameter_sweep_2D.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/project_map.txt" beforeDir="false" afterPath="$PROJECT_DIR$/project_map.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/hr_model/model.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/hr_model/model.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/visualization/plotting.py" beforeDir="false" afterPath="$PROJECT_DIR$/visualization/plotting.py" afterDir="false" />
-    </list>
+    <list default="true" id="329fa9e5-44a8-417a-9e59-78d39b36ad50" name="Changes" comment="plotting features" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -109,7 +100,7 @@
       <workItem from="1756422731219" duration="5370000" />
       <workItem from="1756428179108" duration="200000" />
       <workItem from="1756462232228" duration="5051000" />
-      <workItem from="1756467367474" duration="1701000" />
+      <workItem from="1756467367474" duration="1905000" />
     </task>
     <task id="LOCAL-00001" summary="initial commit">
       <option name="closed" value="true" />
@@ -159,7 +150,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756427371539</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="plotting features">
+      <option name="closed" value="true" />
+      <created>1756469223504</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1756469223504</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -182,7 +181,8 @@
     <MESSAGE value="nothing important" />
     <MESSAGE value="pinn codes added" />
     <MESSAGE value="..." />
-    <option name="LAST_COMMIT_MESSAGE" value="..." />
+    <MESSAGE value="plotting features" />
+    <option name="LAST_COMMIT_MESSAGE" value="plotting features" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/Thesis$model.coverage" NAME="model Coverage Results" MODIFIED="1756467615885" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/hr_model" />
