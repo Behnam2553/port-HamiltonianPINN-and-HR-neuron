@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import pickle
 import sys
 from src.hr_model.model import DEFAULT_PARAMS
+import os
 
 # JAX configuration to use 64-bit precision.
 jax.config.update("jax_enable_x64", True)
@@ -460,7 +461,7 @@ validation_split = 0.2
 initial_learning_rate = 1e-3
 end_learning_rate = 5e-5
 decay_steps = 3000
-epochs = 5000
+epochs = 5
 
 # Physics loss hyperparameters with warmup
 lambda_conservative_max = 1
@@ -612,6 +613,9 @@ print(f"Best validation loss achieved: {best_val_loss:.6f}")
 # 5. VISUALIZATION AND ANALYSIS
 # ==============================================================================
 
+output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'results', 'PINN/')
+os.makedirs(output_dir, exist_ok=True)
+
 print("\nGenerating visualization plots...")
 # Use the full, unsplit, time-ordered data for coherent plots
 t_test = t.reshape(-1, 1)
@@ -657,6 +661,7 @@ plt.xlabel("Time", fontsize=14)
 plt.ylabel("Hamiltonian Value", fontsize=14)
 plt.legend(fontsize=12)
 plt.grid(True)
+plt.savefig(os.path.join(output_dir, 'hamiltonian_comparison.png'), dpi=300)
 plt.tight_layout()
 
 
@@ -674,6 +679,7 @@ plt.xlabel('Epoch', fontsize=12)
 plt.ylabel('Loss (Log Scale)', fontsize=12)
 plt.legend()
 plt.grid(True, which="both", ls="--")
+plt.savefig(os.path.join(output_dir, 'training_losses.png'), dpi=300)
 plt.tight_layout()
 
 # --- Plot 3: Derivative Comparison (Physics Fidelity) ---
@@ -692,6 +698,7 @@ for i in range(s_test.shape[1]):
     axes[i].legend(loc='upper right')
 
 axes[-1].set_xlabel("Time", fontsize=14)
+fig.savefig(os.path.join(output_dir, 'derivative_fidelity.png'), dpi=300)
 plt.tight_layout(rect=[0, 0, 1, 0.97])
 
 # --- Plot 4: Error System State Trajectories (s) ---
@@ -705,6 +712,7 @@ for i in range(s_test.shape[1]):
     axes[i].grid(True)
     axes[i].legend(loc='upper right')
 axes[-1].set_xlabel("Time", fontsize=14)
+fig.savefig(os.path.join(output_dir, 'error_state_s_prediction.png'), dpi=300)
 plt.tight_layout(rect=[0, 0, 1, 0.97])
 
 # --- Plot 5: HR System State Trajectories (q) ---
@@ -721,8 +729,8 @@ for i in range(q_test.shape[1]):
     axes[i].grid(True)
     axes[i].legend(loc='upper right')
 axes[-1].set_xlabel("Time", fontsize=14)
+fig.savefig(os.path.join(output_dir, 'hr_state_q_prediction.png'), dpi=300)
 plt.tight_layout(rect=[0, 0, 1, 0.97])
 
-
-plt.show()
-#%%
+plt.close('all')
+print(f"All plots saved to {output_dir}")
