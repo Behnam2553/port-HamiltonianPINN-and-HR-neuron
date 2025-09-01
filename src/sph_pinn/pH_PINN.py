@@ -1,28 +1,3 @@
-
-"""
-This script implements a Physics-Informed Stable Port-Hamiltonian Neural Network.
-The model learns the underlying physical structure of an error-feedback system
-by training a composite model that simultaneously predicts the system's state
-and enforces the port-Hamiltonian structure as a physics constraint.
-The model is composed of two main parts:
-1.  State Prediction Network: An MLP with Fourier features (StateNN)
-    learns the combined state trajectories q(t) and s(t).
-2.  Port-Hamiltonian Networks: Three networks that define the error system's
-    dynamics based on the predicted state s_pred:
-      s_dot = (J(s) - R(s)) * grad(H(s))
-    - HamiltonianNN (H): A convex network learning the system's energy.
-    - DynamicJ_NN (J): An MLP learning the conservative dynamics.
-    - DissipationNN (R): An MLP learning the dissipative dynamics.
-The training loss is a combination of:
-- Data Fidelity Loss: MSE between predicted states (s_pred, q_pred) and true data.
-- Conservative Loss: Enforces that the learned Hamiltonian is invariant
-  under the conservative flow (Lie derivative is zero).
-- Dissipative Loss: Enforces that the time derivative of the Hamiltonian
-  is correctly described by the dissipative flow.
-- Physics Structure Loss: Enforces that the output of the learned sPHNN
-  structure matches the analytical vector field.
-"""
-
 import jax, jax.numpy as jnp
 import equinox as eqx
 import optax
@@ -35,6 +10,7 @@ import os
 # JAX configuration to use 64-bit precision.
 jax.config.update("jax_enable_x64", True)
 
+
 # ==============================================================================
 # 1. NEURAL NETWORK DEFINITIONS
 # ==============================================================================
@@ -43,14 +19,20 @@ class FourierFeatures(eqx.Module):
     """Encodes a 1D input into a higher-dimensional space using Fourier features."""
     b_matrix: jax.Array
     output_size: int = eqx.field(static=True)
+
     def __init__(self, key, in_size=1, mapping_size=32, scale=1):
         n_pairs = mapping_size // 2
         self.b_matrix = jax.random.normal(key, (n_pairs, in_size)) * scale
         self.output_size = n_pairs * 2
 
     def __call__(self, t):
-        if t.ndim == 1:
+        # CORRECTED: Handle scalar inputs (ndim=0) which occur during jacobian calculation.
+        # This ensures `t` is always a 2D array before the matrix multiplication.
+        if t.ndim == 0:
+            t = t.reshape(1, 1)
+        elif t.ndim == 1:
             t = t[None, :]
+
         t_proj = t @ self.b_matrix.T
         return jnp.concatenate([jnp.sin(t_proj), jnp.cos(t_proj)], axis=-1).squeeze()
 
@@ -58,16 +40,16 @@ class FourierFeatures(eqx.Module):
 class StateNN(eqx.Module):
     """An MLP with Fourier Features to approximate the combined state [q(t), s(t)]."""
     layers: list
+    activation: callable
 
-    def __init__(self, key, out_size=15, width=256, depth=3, mapping_size=32, scale=300):
+    def __init__(self, key, out_size, width, depth, activation, mapping_size, scale):
         fourier_key, *layer_keys = jax.random.split(key, depth + 1)
+        self.activation = activation
 
-        # Create the Fourier layer first to access its output_size
         fourier_layer = FourierFeatures(fourier_key, in_size=1, mapping_size=mapping_size, scale=scale)
 
         self.layers = [
             fourier_layer,
-            # Use the actual output size for the next layer's input
             eqx.nn.Linear(fourier_layer.output_size, width, key=layer_keys[0]),
             *[eqx.nn.Linear(width, width, key=key) for i in range(1, depth - 1)],
             eqx.nn.Linear(width, out_size, key=layer_keys[-1])
@@ -76,11 +58,11 @@ class StateNN(eqx.Module):
     def __call__(self, t):
         x = self.layers[0](t)
         for layer in self.layers[1:-1]:
-            x = jax.nn.tanh(layer(x))
+            x = self.activation(layer(x))
         return self.layers[-1](x)
 
 
-# --- sPHNN Component Networks (from sPHNN implementation) ---
+# --- sPHNN Component Networks (Adapted for Windowed Data with LSTMs) ---
 
 class _FICNN(eqx.Module):
     """Internal helper class for a Fully Input Convex Neural Network."""
@@ -89,8 +71,8 @@ class _FICNN(eqx.Module):
     final_layer: eqx.nn.Linear
     activation: callable = eqx.field(static=True)
 
-    def __init__(self, key, in_size: int, out_size: int, width: int, depth: int):
-        self.activation = jax.nn.softplus
+    def __init__(self, key, in_size: int, out_size: int, width: int, depth: int, activation: callable):
+        self.activation = activation
         keys = jax.random.split(key, depth)
         self.w_layers = [eqx.nn.Linear(in_size, width, key=keys[0])]
         self.w_layers.extend([eqx.nn.Linear(in_size, width, key=key) for key in keys[1:-1]])
@@ -107,96 +89,167 @@ class _FICNN(eqx.Module):
 
 
 class HamiltonianNN(eqx.Module):
-    """Learns a convex Hamiltonian function H(x) with a guaranteed minimum at x0."""
+    """
+    Learns a convex Hamiltonian H(s) using an LSTM to process history and
+    a FICNN to guarantee convexity.
+    MODIFIED: Now outputs a sequence of H values for the entire window.
+    """
+    lstm: eqx.nn.LSTMCell
     ficnn: _FICNN
-    x0: jax.Array
-    epsilon: float = eqx.field(static=True)
+    state_dim: int = eqx.field(static=True)
+    hidden_size: int = eqx.field(static=True)
 
-    def __init__(self, key, in_size, width, depth, x0, epsilon):
-        self.ficnn = _FICNN(key, in_size, out_size=1, width=width, depth=depth)
-        self.x0 = x0
-        self.epsilon = epsilon
+    def __init__(self, key, state_dim, hidden_size, ficnn_width, ficnn_depth, ficnn_activation):
+        lstm_key, ficnn_key = jax.random.split(key)
 
-    def __call__(self, x):
-        # Implements Equation (10) from the paper
-        f_x = self.ficnn(x)
-        f_x0 = self.ficnn(self.x0)
-        grad_f_x0 = jax.grad(self.ficnn)(self.x0)
-        # Normalization term to set H(x0)=0 and grad H(x0)=0
-        f_norm = f_x0 + jnp.dot(grad_f_x0, x - self.x0)
-        # Regularization term to ensure a strict minimum
-        f_reg = self.epsilon * jnp.sum((x - self.x0) ** 2)
-        return f_x - f_norm + f_reg
+        self.state_dim = state_dim
+        self.hidden_size = hidden_size
+
+        self.lstm = eqx.nn.LSTMCell(input_size=state_dim, hidden_size=hidden_size, key=lstm_key)
+
+        ficnn_in_size = state_dim + hidden_size
+        self.ficnn = _FICNN(ficnn_key, in_size=ficnn_in_size, out_size=1,
+                            width=ficnn_width, depth=ficnn_depth, activation=ficnn_activation)
+
+    def __call__(self, s_window):
+        h0 = jnp.zeros((self.hidden_size,))
+        c0 = jnp.zeros((self.hidden_size,))
+        initial_carry = (h0, c0)
+
+        def lstm_scan(carry, x):
+            new_carry = self.lstm(x, carry)
+            return new_carry, new_carry[0]
+
+        # CHANGED: Capture the entire sequence of hidden states from the LSTM
+        _, hidden_states_sequence = jax.lax.scan(lstm_scan, initial_carry, s_window)
+
+        # CHANGED: Create an augmented input for every time step in the window
+        augmented_input_sequence = jnp.concatenate([s_window, hidden_states_sequence], axis=-1)
+
+        # CHANGED: Apply the FICNN to each time step in the sequence using vmap
+        return jax.vmap(self.ficnn)(augmented_input_sequence)
 
 
 class DissipationNN(eqx.Module):
-    """Learns a positive semi-definite dissipation matrix R(s) = L(s)L(s)^T."""
+    """
+    Learns a positive semi-definite dissipation matrix R(s) = L(s)L(s)^T
+    using an LSTM followed by an MLP.
+    MODIFIED: Now outputs a sequence of R matrices for the entire window.
+    """
+    lstm: eqx.nn.LSTMCell
     layers: list
     activation: callable
-    state_dim: int
+    state_dim: int = eqx.field(static=True)
 
-    def __init__(self, key, state_dim, width, depth, activation):
+    def __init__(self, key, state_dim, hidden_size, width, depth, activation):
         self.state_dim = state_dim
-        num_l_elements = state_dim * (state_dim + 1) // 2
-        keys = jax.random.split(key, depth)
-        self.layers = [
-            eqx.nn.Linear(state_dim, width, key=keys[0]),
-            *[eqx.nn.Linear(width, width, key=key) for key in keys[1:-1]],
-            eqx.nn.Linear(width, num_l_elements, key=keys[-1])
-        ]
         self.activation = activation
 
-    def __call__(self, s):
+        # CORRECTED: Changed `self.num_l_elements` to a local variable `num_l_elements`
+        num_l_elements = state_dim * (state_dim + 1) // 2
+
+        lstm_key, *layer_keys = jax.random.split(key, depth + 1)
+
+        self.lstm = eqx.nn.LSTMCell(input_size=state_dim, hidden_size=hidden_size, key=lstm_key)
+
+        self.layers = [
+            eqx.nn.Linear(hidden_size, width, key=layer_keys[0]),
+            *[eqx.nn.Linear(width, width, key=key) for key in layer_keys[1:-1]],
+            eqx.nn.Linear(width, num_l_elements, key=layer_keys[-1])
+        ]
+
+    def _apply_mlp(self, x):
         for layer in self.layers[:-1]:
-            s = self.activation(layer(s))
-        l_elements = self.layers[-1](s)
-        
-        # Build the lower triangular matrix L
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+    def _construct_matrix(self, l_elements):
         L = jnp.zeros((self.state_dim, self.state_dim))
         tril_indices = jnp.tril_indices(self.state_dim)
         L = L.at[tril_indices].set(l_elements)
-        
-        # Enforce positive diagonal elements for positive definiteness
+
         positive_diag = jax.nn.softplus(jnp.diag(L))
         L = L.at[jnp.diag_indices(self.state_dim)].set(positive_diag)
-        
-        # Return R = L @ L.T
         return L @ L.T
+
+    def __call__(self, s_window):
+        h0 = jnp.zeros((self.lstm.hidden_size,))
+        c0 = jnp.zeros((self.lstm.hidden_size,))
+        initial_carry = (h0, c0)
+
+        def lstm_scan(carry, x):
+            new_carry = self.lstm(x, carry)
+            return new_carry, new_carry[0]
+
+        # CHANGED: Capture the sequence of hidden states
+        _, hidden_states_sequence = jax.lax.scan(lstm_scan, initial_carry, s_window)
+
+        # CHANGED: Apply MLP and matrix construction to the entire sequence
+        l_elements_seq = jax.vmap(self._apply_mlp)(hidden_states_sequence)
+        R_matrix_seq = jax.vmap(self._construct_matrix)(l_elements_seq)
+
+        return R_matrix_seq
 
 
 class DynamicJ_NN(eqx.Module):
-    """Learns a skew-symmetric structure matrix J(s)."""
+    """
+    Learns a skew-symmetric structure matrix J(s) using an LSTM
+    followed by an MLP.
+    MODIFIED: Now outputs a sequence of J matrices for the entire window.
+    """
+    lstm: eqx.nn.LSTMCell
     layers: list
-    state_dim: int
     activation: callable
+    state_dim: int = eqx.field(static=True)
 
-    def __init__(self, key, state_dim, width, depth, activation):
+    def __init__(self, key, state_dim, hidden_size, width, depth, activation):
         self.state_dim = state_dim
-        num_unique_elements = state_dim * (state_dim - 1) // 2
-        keys = jax.random.split(key, depth + 1)
-        self.layers = [
-            eqx.nn.Linear(state_dim, width, key=keys[0]),
-            *[eqx.nn.Linear(width, width, key=key) for key in keys[1:-1]],
-            eqx.nn.Linear(width, num_unique_elements, key=keys[-1])
-        ]
         self.activation = activation
 
-    def __call__(self, s):
+        # CORRECTED: Changed `self.num_unique_elements` to a local variable `num_unique_elements`
+        num_unique_elements = state_dim * (state_dim - 1) // 2
+
+        lstm_key, *layer_keys = jax.random.split(key, depth + 1)
+
+        self.lstm = eqx.nn.LSTMCell(input_size=state_dim, hidden_size=hidden_size, key=lstm_key)
+
+        self.layers = [
+            eqx.nn.Linear(hidden_size, width, key=layer_keys[0]),
+            *[eqx.nn.Linear(width, width, key=key) for key in layer_keys[1:-1]],
+            eqx.nn.Linear(width, num_unique_elements, key=layer_keys[-1])
+        ]
+
+    def _apply_mlp(self, x):
         for layer in self.layers[:-1]:
-            s = self.activation(layer(s))
-        upper_triangle_elements = self.layers[-1](s)
-        
-        # Build the matrix from its upper triangular elements
+            x = self.activation(layer(x))
+        return self.layers[-1](x)
+
+    def _construct_matrix(self, upper_triangle_elements):
         J = jnp.zeros((self.state_dim, self.state_dim))
         triu_indices = jnp.triu_indices(self.state_dim, k=1)
         J = J.at[triu_indices].set(upper_triangle_elements)
-        
-        # Enforce skew-symmetry: J = J - J.T
         return J - J.T
+
+    def __call__(self, s_window):
+        h0 = jnp.zeros((self.lstm.hidden_size,))
+        c0 = jnp.zeros((self.lstm.hidden_size,))
+        initial_carry = (h0, c0)
+
+        def lstm_scan(carry, x):
+            new_carry = self.lstm(x, carry)
+            return new_carry, new_carry[0]
+
+        # CHANGED: Capture the sequence of hidden states
+        _, hidden_states_sequence = jax.lax.scan(lstm_scan, initial_carry, s_window)
+
+        # CHANGED: Apply MLP and matrix construction to the entire sequence
+        upper_tri_elems_seq = jax.vmap(self._apply_mlp)(hidden_states_sequence)
+        J_matrix_seq = jax.vmap(self._construct_matrix)(upper_tri_elems_seq)
+
+        return J_matrix_seq
 
 
 # --- The Combined Model ---
-
 class Combined_sPHNN_PINN(eqx.Module):
     """Main model combining a unified state predictor and sPHNN structure."""
     state_net: StateNN
@@ -206,29 +259,51 @@ class Combined_sPHNN_PINN(eqx.Module):
 
     def __init__(self, key, config):
         state_key, h_key, d_key, j_key = jax.random.split(key, 4)
-        state_dim = config['state_dim']
-        # The equilibrium point for the normalized error system is the origin.
-        x0_norm = jnp.zeros(state_dim)
 
-        self.state_net = StateNN(key=state_key)
+        state_dim = config['state_dim']
+        q_dim = config['q_dim']
+
+        # Unpack configs for clarity
+        cfg_state = config['state_nn']
+        cfg_h = config['hamiltonian_nn']
+        cfg_d = config['dissipation_nn']
+        cfg_j = config['j_net']
+
+        self.state_net = StateNN(
+            key=state_key,
+            out_size=state_dim + q_dim,
+            width=cfg_state['width'],
+            depth=cfg_state['depth'],
+            activation=cfg_state['activation'],
+            mapping_size=cfg_state['fourier_features']['mapping_size'],
+            scale=cfg_state['fourier_features']['scale']
+        )
         self.hamiltonian_net = HamiltonianNN(
-            h_key, in_size=state_dim, width=config['h_width'], depth=config['h_depth'],
-            x0=x0_norm, epsilon=config['h_epsilon']
+            h_key, state_dim=state_dim,
+            hidden_size=cfg_h['hidden_size'],
+            ficnn_width=cfg_h['ficnn']['width'],
+            ficnn_depth=cfg_h['ficnn']['depth'],
+            ficnn_activation=cfg_h['ficnn']['activation']
         )
         self.dissipation_net = DissipationNN(
-            d_key, state_dim=state_dim, width=config['d_width'],
-            depth=config['d_depth'], activation=config['activation']
+            d_key, state_dim=state_dim,
+            hidden_size=cfg_d['hidden_size'],
+            width=cfg_d['width'],
+            depth=cfg_d['depth'],
+            activation=cfg_d['activation']
         )
         self.j_net = DynamicJ_NN(
-            j_key, state_dim=state_dim, width=config['j_width'],
-            depth=config['j_depth'], activation=config['activation']
+            j_key, state_dim=state_dim,
+            hidden_size=cfg_j['hidden_size'],
+            width=cfg_j['width'],
+            depth=cfg_j['depth'],
+            activation=cfg_j['activation']
         )
 
 
 # ==============================================================================
-# 2. DATA HANDLING
+# 2. DATA HANDLING (omitted for brevity, no changes)
 # ==============================================================================
-
 def generate_data(file_path="error_system_data.pkl"):
     """
     Loads and prepares training data from a pre-generated pickle file containing
@@ -289,15 +364,38 @@ def normalize(data, mean, std):
     """Normalizes data using pre-computed statistics."""
     return (data - mean) / (std + 1e-8)
 
+
 def denormalize(data, mean, std):
     """Denormalizes data using pre-computed statistics."""
     return data * std + mean
 
 
-# ==============================================================================
-# 3. TRAINING LOGIC
-# ==============================================================================
+def create_windows(window_size: int, *arrays):
+    """
+    Creates overlapping windows from a set of time-series arrays using
+    JAX-native indexing.
+    """
+    num_samples = arrays[0].shape[0]
+    num_windows = num_samples - window_size + 1
 
+    if num_windows <= 0:
+        # Return empty arrays with correct dimensions if the input is smaller than the window
+        return tuple(jnp.empty((0, window_size) + arr.shape[1:]) for arr in arrays)
+
+    # Create a 2D array of indices that represents all windows
+    start_indices = jnp.arange(num_windows)[:, None]
+    window_offsets = jnp.arange(window_size)[None, :]
+    indices = start_indices + window_offsets
+
+    # Use the indices to gather the windowed data from each array
+    windowed_arrays = [arr[indices] for arr in arrays]
+
+    return tuple(windowed_arrays)
+
+
+# ==============================================================================
+# 3. TRAINING LOGIC (omitted for brevity, no changes)
+# ==============================================================================
 # --- Helper functions for the new physics-based loss terms ---
 
 def _alpha(u1, u2, m):
@@ -311,8 +409,9 @@ def _alpha(u1, u2, m):
         jnp.logical_and(u1 <= -1, u2 >= 1),
         jnp.logical_and(u1 <= -1, jnp.logical_and(u2 > -1, u2 < 1)),
     ]
-    choices = [2*m - 1., -1., -1., 2*m - 1., -1., -1., 2*m - 1.]
+    choices = [2 * m - 1., -1., -1., 2 * m - 1., -1., -1., 2 * m - 1.]
     return jnp.select(conds, choices, default=-1.)
+
 
 def _beta(u1, u2, m):
     """Helper function for the dissipative field f_d."""
@@ -326,26 +425,28 @@ def _beta(u1, u2, m):
         jnp.logical_and(u1 <= -1, jnp.logical_and(u2 > -1, u2 < 1)),
     ]
     choices = [
-        2*m * (u1 - 1), -4*m, -2*m * (u1 - 1), 0.,
-        -2*m * (u1 + 1), 4*m, 2*m * (u1 + 1),
+        2 * m * (u1 - 1), -4 * m, -2 * m * (u1 - 1), 0.,
+        -2 * m * (u1 + 1), 4 * m, 2 * m * (u1 + 1),
     ]
     return jnp.select(conds, choices, default=0.)
+
 
 def f_c_fn(e, q, hr_params):
     """Calculates the conservative vector field f_c(e)."""
     e_x, e_y, e_u, e_phi = e[0], e[1], e[3], e[4]
     x1, u1 = q[0], q[3]
-    
+
     k, f, rho, d, r, s = \
         hr_params['k'], hr_params['f'], hr_params['rho'], hr_params['d'], hr_params['r'], hr_params['s']
-    
+
     return jnp.array([
-        e_y + 2*k*f*u1*x1*e_u + rho*x1*e_phi,
-        -2*d*x1*e_x,
-        r*s*e_x,
+        e_y + 2 * k * f * u1 * x1 * e_u + rho * x1 * e_phi,
+        -2 * d * x1 * e_x,
+        r * s * e_x,
         e_x,
         e_x
     ])
+
 
 def f_d_fn(e, q, hr_params):
     """Calculates the dissipative vector field f_d(e)."""
@@ -354,10 +455,10 @@ def f_d_fn(e, q, hr_params):
 
     a, b, k, h, f, rho, g_e, r, q_param, m = \
         hr_params['a'], hr_params['b'], hr_params['k'], hr_params['h'], \
-        hr_params['f'], hr_params['rho'], hr_params['ge'], hr_params['r'], \
-        hr_params['q'], hr_params['m']
+            hr_params['f'], hr_params['rho'], hr_params['ge'], hr_params['r'], \
+            hr_params['q'], hr_params['m']
 
-    N_val = -3*a*x1**2 + 2*b*x1 + k*h + k*f*u1**2 + rho*phi1 - 2*g_e
+    N_val = -3 * a * x1 ** 2 + 2 * b * x1 + k * h + k * f * u1 ** 2 + rho * phi1 - 2 * g_e
     alpha_val = _alpha(u1, u2, m)
     beta_val = _beta(u1, u2, m)
 
@@ -369,74 +470,105 @@ def f_d_fn(e, q, hr_params):
         -q_param * e_phi
     ])
 
+
 @eqx.filter_jit
-def loss_fn(model: Combined_sPHNN_PINN, t_batch_norm, s_true_batch_norm, q_true_batch_norm, s_dot_true_batch_norm, H_true_batch_norm,
+def loss_fn(model: Combined_sPHNN_PINN, t_batch_norm, s_true_batch_norm, q_true_batch_norm, s_dot_true_batch_norm,
+            H_true_batch_norm,
             lambda_conservative: float, lambda_dissipative: float, lambda_physics: float, hr_params: dict,
             t_mean, t_std, s_mean, s_std, q_mean, q_std, s_dot_mean, s_dot_std, H_mean, H_std):
-    """Calculates the composite data and new physics-based losses."""
+    """
+    Calculates composite loss based on the ENTIRE time step of each window.
+    """
+    # --- Part 1: State Prediction for the entire window ---
+    batch_size, window_size = t_batch_norm.shape[0], t_batch_norm.shape[1]
+    t_batch_flat = t_batch_norm.reshape(-1, 1)
+    all_states_pred_flat = jax.vmap(model.state_net)(t_batch_flat)
+    all_states_pred_windows_norm = all_states_pred_flat.reshape(batch_size, window_size, -1)
 
-    # --- Part 1: State Prediction and Unified Data Fidelity Loss ---
-    all_states_pred_norm = jax.vmap(model.state_net)(t_batch_norm)
-    all_states_true_norm = jnp.concatenate([q_true_batch_norm, s_true_batch_norm], axis=1)
-    data_loss = jnp.mean((all_states_pred_norm - all_states_true_norm) ** 2)
+    q_pred_windows_norm = all_states_pred_windows_norm[:, :, :10]
+    s_pred_windows_norm = all_states_pred_windows_norm[:, :, 10:]
 
-    q_pred_batch_norm = all_states_pred_norm[:, :10]
-    s_pred_batch_norm = all_states_pred_norm[:, 10:]
+    # --- Part 2: Unified Data Fidelity Loss (on entire window) ---
+    all_states_true_windows_norm = jnp.concatenate([q_true_batch_norm, s_true_batch_norm], axis=-1)
+    data_loss = jnp.mean((all_states_pred_windows_norm - all_states_true_windows_norm) ** 2)
 
-    s_pred = denormalize(s_pred_batch_norm, s_mean, s_std)
-    q_pred = denormalize(q_pred_batch_norm, q_mean, q_std)
+    # --- Part 3: Denormalize values for physics calculations ---
+    # Use true `s` for stability during training, but predicted `q`
+    s_true_windows = denormalize(s_true_batch_norm, s_mean, s_std)
+    q_pred_windows = denormalize(q_pred_windows_norm, q_mean, q_std)
 
-    # --- Part 2: Physics Calculations ---
-    grad_H_norm_fn = jax.vmap(jax.grad(model.hamiltonian_net))
-    grad_H_norm = grad_H_norm_fn(s_pred_batch_norm)
+    # --- Part 4: Physics Calculations (vmapped over batch and window) ---
+
+    # Calculate Jacobian of H_seq w.r.t s_seq to get grad_H at each time step
+    def get_grad_H(s_window_norm):
+        jac_H_fn = jax.jacfwd(model.hamiltonian_net)
+        # Jacobian has shape (window_size_out, window_size_in, state_dim)
+        # We need the diagonal part where input time step matches output time step
+        return jnp.diagonal(jac_H_fn(s_window_norm), axis1=0, axis2=1).T
+
+    grad_H_norm = jax.vmap(get_grad_H)(s_true_batch_norm)  # Use true s for stability
     grad_H = grad_H_norm / (s_std + 1e-8)
 
-    f_c_batch = jax.vmap(f_c_fn, in_axes=(0, 0, None))(s_pred, q_pred, hr_params)
-    f_d_batch = jax.vmap(f_d_fn, in_axes=(0, 0, None))(s_pred, q_pred, hr_params)
+    # Get s_dot from autodiff of the StateNN
+    def get_s_dot_autodiff(t_window_norm):
+        jac_s_fn = jax.jacfwd(lambda t: model.state_net(t)[10:])
+        # The jacobian of f(scalar) -> vector(5) is a vector of shape (5,).
+        # Vmapping over the 64 time steps gives the correct (64, 5) shape.
+        # CORRECTED: Removed the unnecessary .squeeze(-1) at the end.
+        return jax.vmap(jac_s_fn)(t_window_norm.squeeze(-1))
 
-    # Calculate s_dot from autodiff
-    get_autodiff_grad_s_slice = lambda net, t: jax.jvp(lambda t_scalar: net(t_scalar)[10:], (t,), (jnp.ones_like(t),))[1]
-    s_dot_autodiff_norm = jax.vmap(get_autodiff_grad_s_slice, in_axes=(None, 0))(model.state_net, t_batch_norm)
+    s_dot_autodiff_norm = jax.vmap(get_s_dot_autodiff)(t_batch_norm)
     s_dot_autodiff = s_dot_autodiff_norm * (s_std / (t_std + 1e-8))
 
-    # --- Part 3: Loss Components ---
-    # Physics Structure Loss (now named 'phys')
-    J_norm = jax.vmap(model.j_net)(s_pred_batch_norm)
-    R_norm = jax.vmap(model.dissipation_net)(s_pred_batch_norm)
-    s_dot_from_structure_norm = jax.vmap(lambda j, r, g: (j - r) @ g)(J_norm, R_norm, grad_H_norm)
-    s_dot_from_structure = s_dot_from_structure_norm * s_std
-    s_dot_diss_cons = f_c_batch + f_d_batch
+    # Calculate analytical physics terms for the full window
+    # CORRECTED: Added in_axes=(0, 0, None) to the outer vmap to handle the static hr_params
+    f_c_batch = jax.vmap(jax.vmap(f_c_fn, in_axes=(0, 0, None)), in_axes=(0, 0, None))(s_true_windows, q_pred_windows,
+                                                                                       hr_params)
+    f_d_batch = jax.vmap(jax.vmap(f_d_fn, in_axes=(0, 0, None)), in_axes=(0, 0, None))(s_true_windows, q_pred_windows,
+                                                                                       hr_params)
+
+    # --- Part 5: Loss Components (calculated on entire window) ---
+    # Physics Structure Loss
+    J = jax.vmap(model.j_net)(s_true_batch_norm)
+    R = jax.vmap(model.dissipation_net)(s_true_batch_norm)
+
+    # vmap the mat-vec product (J-R) @ grad_H over the window dimension
+    # CORRECTED: Use a nested vmap to map over both the batch and window dimensions.
+    s_dot_from_structure = jax.vmap(jax.vmap(lambda j, r, g: (j - r) @ g))(J, R, grad_H)
     s_dot_true_batch = denormalize(s_dot_true_batch_norm, s_dot_mean, s_dot_std)
-    
-    # Conservative Loss
-    lie_derivative = jax.vmap(jnp.dot)(f_c_batch, grad_H)
+    loss_phys = jnp.mean((s_dot_true_batch - s_dot_from_structure) ** 2)
+
+    # Conservative Loss (Lie Derivative = <grad_H, f_c>)
+    # Conservative Loss (Lie Derivative = <grad_H, f_c>)
+    # CORRECTED: Replaced the incorrect vmap(dot) with element-wise multiplication and sum.
+    lie_derivative = jnp.sum(grad_H * f_c_batch, axis=2)
     loss_conservative = jnp.mean(lie_derivative ** 2)
 
     # Dissipative Loss
-    dHdt_from_autodiff = jax.vmap(jnp.dot)(grad_H, s_dot_autodiff)
-    dHdt_from_equations = jax.vmap(jnp.dot)(grad_H, f_d_batch)
+    # CORRECTED: Applied the same fix to the dH/dt calculations.
+    dHdt_from_autodiff = jnp.sum(grad_H * s_dot_autodiff, axis=2)
+    dHdt_from_equations = jnp.sum(grad_H * f_d_batch, axis=2)
     loss_dissipative = jnp.mean((dHdt_from_autodiff - dHdt_from_equations) ** 2)
 
-    # Hamiltonian Loss (for monitoring only)
-    H_pred_norm = jax.vmap(model.hamiltonian_net)(s_pred_batch_norm)
+    # Hamiltonian Loss (for monitoring)
+    H_pred_norm = jax.vmap(model.hamiltonian_net)(s_true_batch_norm)
     H_pred = denormalize(H_pred_norm, H_mean, H_std)
     H_true = denormalize(H_true_batch_norm, H_mean, H_std)
-    
+
+    # Align the whole sequence
     correlation = jnp.corrcoef(H_true.flatten(), H_pred.flatten())[0, 1]
     sign = jnp.sign(correlation)
     H_pred_aligned = sign * H_pred - jnp.mean(sign * H_pred) + jnp.mean(H_true)
     loss_hamiltonian = jnp.mean((H_pred_aligned - H_true) ** 2)
 
+    # --- Part 6: Total Loss ---
+    s_dot_from_equations = f_c_batch + f_d_batch
+    state_loss = data_loss + jnp.mean((s_dot_true_batch - s_dot_from_equations) ** 2)
 
-    loss_phys = jnp.mean((s_dot_true_batch - s_dot_from_structure) ** 2)
-
-    # --- Part 4: Total Loss ---
-    state_loss = data_loss + jnp.mean((s_dot_true_batch - s_dot_diss_cons) ** 2)
     total_loss = (state_loss
                   + (lambda_conservative * loss_conservative)
                   + (lambda_dissipative * loss_dissipative)
                   + (lambda_physics * loss_phys))
-
 
     loss_components = {
         "total": total_loss,
@@ -449,16 +581,14 @@ def loss_fn(model: Combined_sPHNN_PINN, t_batch_norm, s_true_batch_norm, q_true_
     return total_loss, loss_components
 
 
-
-
 @eqx.filter_jit
 def train_step(model, opt_state, optimizer, t_batch_norm, s_batch_norm, q_batch_norm, s_dot_batch_norm, H_batch_norm,
-               lambda_conservative, lambda_dissipative, lambda_physics, hr_params, 
+               lambda_conservative, lambda_dissipative, lambda_physics, hr_params,
                t_mean, t_std, s_mean, s_std, q_mean, q_std, s_dot_mean, s_dot_std, H_mean, H_std):
-    """Performs a single training step."""
+    """Performs a single training step on a batch of windows."""
     (loss_val, loss_components), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
         model, t_batch_norm, s_batch_norm, q_batch_norm, s_dot_batch_norm, H_batch_norm,
-        lambda_conservative, lambda_dissipative, lambda_physics, hr_params, 
+        lambda_conservative, lambda_dissipative, lambda_physics, hr_params,
         t_mean, t_std, s_mean, s_std, q_mean, q_std, s_dot_mean, s_dot_std, H_mean, H_std
     )
     updates, opt_state = optimizer.update(grads, opt_state, model)
@@ -468,12 +598,12 @@ def train_step(model, opt_state, optimizer, t_batch_norm, s_batch_norm, q_batch_
 
 @eqx.filter_jit
 def evaluate_model(model, t_batch_norm, s_batch_norm, q_batch_norm, s_dot_batch_norm, H_batch_norm,
-                   lambda_conservative, lambda_dissipative, lambda_physics, hr_params, 
+                   lambda_conservative, lambda_dissipative, lambda_physics, hr_params,
                    t_mean, t_std, s_mean, s_std, q_mean, q_std, s_dot_mean, s_dot_std, H_mean, H_std):
-    """Calculates the loss for the validation set."""
+    """Calculates the loss for the validation set (a batch of windows)."""
     loss_val, _ = loss_fn(
         model, t_batch_norm, s_batch_norm, q_batch_norm, s_dot_batch_norm, H_batch_norm,
-        lambda_conservative, lambda_dissipative, lambda_physics, hr_params, 
+        lambda_conservative, lambda_dissipative, lambda_physics, hr_params,
         t_mean, t_std, s_mean, s_std, q_mean, q_std, s_dot_mean, s_dot_std, H_mean, H_std
     )
     return loss_val
@@ -489,7 +619,8 @@ def main():
     model_key, data_key = jax.random.split(key)
 
     # Training hyperparameters
-    batch_size = 8000
+    window_size = 32
+    batch_size = 128
     validation_split = 0.2
     initial_learning_rate = 1e-3
     end_learning_rate = 5e-5
@@ -506,59 +637,101 @@ def main():
     hr_params = DEFAULT_PARAMS.copy()
 
     # --- Generate and Prepare Data ---
-    import os
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'results', 'PINN Data/', 'error_system_data.pkl')
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'results', 'PINN Data/',
+                        'error_system_data.pkl')
     t, s, q, s_dot_true, H_analytical = generate_data(path)
     if t is None:
         sys.exit("Exiting: Data loading failed.")
 
-    num_samples = s.shape[0]
-    perm = jax.random.permutation(data_key, num_samples)
-    t_shuffled, s_shuffled, q_shuffled, s_dot_shuffled, H_shuffled = t[perm], s[perm], q[perm], s_dot_true[perm], H_analytical[perm]
-    t_shuffled = t_shuffled.reshape(-1, 1)
+    t = t.reshape(-1, 1)
 
-    split_idx = int(num_samples * (1 - validation_split))
-    t_train, t_val = jnp.split(t_shuffled, [split_idx])
-    s_train, s_val = jnp.split(s_shuffled, [split_idx])
-    q_train, q_val = jnp.split(q_shuffled, [split_idx])
-    s_dot_train, s_dot_val = jnp.split(s_dot_shuffled, [split_idx])
-    H_train, H_val = jnp.split(H_shuffled, [split_idx])
+    # --- 1. Create Windowed Data FIRST (from the original, ordered data) ---
+    print(f"Creating data windows with size {window_size}...")
+    (t_w, s_w, q_w, s_dot_w, H_w) = create_windows(
+        window_size, t, s, q, s_dot_true, H_analytical
+    )
 
-    # --- Normalize Data (using ONLY training set statistics) ---
-    t_mean, t_std = jnp.mean(t_train), jnp.std(t_train)
-    s_mean, s_std = jnp.mean(s_train, axis=0), jnp.std(s_train, axis=0)
-    q_mean, q_std = jnp.mean(q_train, axis=0), jnp.std(q_train, axis=0)
-    s_dot_mean, s_dot_std = jnp.mean(s_dot_train, axis=0), jnp.std(s_dot_train, axis=0)
-    H_mean, H_std = jnp.mean(H_train), jnp.std(H_train)
+    # --- 2. Shuffle the WINDOWS, not the individual points ---
+    num_windows = t_w.shape[0]
+    perm = jax.random.permutation(data_key, num_windows)
+    t_w_shuffled, s_w_shuffled, q_w_shuffled, s_dot_w_shuffled, H_w_shuffled = \
+        t_w[perm], s_w[perm], q_w[perm], s_dot_w[perm], H_w[perm]
 
-    t_train_norm = normalize(t_train, t_mean, t_std)
-    s_train_norm = normalize(s_train, s_mean, s_std)
-    q_train_norm = normalize(q_train, q_mean, q_std)
-    s_dot_train_norm = normalize(s_dot_train, s_dot_mean, s_dot_std)
-    H_train_norm = normalize(H_train, H_mean, H_std)
+    # --- 3. Split the shuffled windows into training and validation sets ---
+    split_idx = int(num_windows * (1 - validation_split))
+    t_train_w, t_val_w = jnp.split(t_w_shuffled, [split_idx])
+    s_train_w, s_val_w = jnp.split(s_w_shuffled, [split_idx])
+    q_train_w, q_val_w = jnp.split(q_w_shuffled, [split_idx])
+    s_dot_train_w, s_dot_val_w = jnp.split(s_dot_w_shuffled, [split_idx])
+    H_train_w, H_val_w = jnp.split(H_w_shuffled, [split_idx])
 
-    t_val_norm = normalize(t_val, t_mean, t_std)
-    s_val_norm = normalize(s_val, s_mean, s_std)
-    q_val_norm = normalize(q_val, q_mean, q_std)
-    s_dot_val_norm = normalize(s_dot_val, s_dot_mean, s_dot_std)
-    H_val_norm = normalize(H_val, H_mean, H_std)
+    # --- Compute Normalization Stats (from flat training data BEFORE windowing) ---
+    num_train_samples = int(s.shape[0] * (1 - validation_split))
+    t_train_flat, s_train_flat, q_train_flat, s_dot_train_flat, H_train_flat = \
+        t[:num_train_samples], s[:num_train_samples], q[:num_train_samples], \
+            s_dot_true[:num_train_samples], H_analytical[:num_train_samples]
 
+    t_mean, t_std = jnp.mean(t_train_flat), jnp.std(t_train_flat)
+    s_mean, s_std = jnp.mean(s_train_flat, axis=0), jnp.std(s_train_flat, axis=0)
+    q_mean, q_std = jnp.mean(q_train_flat, axis=0), jnp.std(q_train_flat, axis=0)
+    s_dot_mean, s_dot_std = jnp.mean(s_dot_train_flat, axis=0), jnp.std(s_dot_train_flat, axis=0)
+    H_mean, H_std = jnp.mean(H_train_flat), jnp.std(H_train_flat)
+
+    # --- 4. Normalize the Windowed Data ---
+    t_train_norm = normalize(t_train_w, t_mean, t_std)
+    s_train_norm = normalize(s_train_w, s_mean, s_std)
+    q_train_norm = normalize(q_train_w, q_mean, q_std)
+    s_dot_train_norm = normalize(s_dot_train_w, s_dot_mean, s_dot_std)
+    H_train_norm = normalize(H_train_w, H_mean, H_std)
+
+    t_val_norm = normalize(t_val_w, t_mean, t_std)
+    s_val_norm = normalize(s_val_w, s_mean, s_std)
+    q_val_norm = normalize(q_val_w, q_mean, q_std)
+    s_dot_val_norm = normalize(s_dot_val_w, s_dot_mean, s_dot_std)
+    H_val_norm = normalize(H_val_w, H_mean, H_std)
 
     # --- Centralized Neural Network Configuration ---
-    s_dim = s_train.shape[1]
-    q_dim = q_train.shape[1]
+    s_dim = s_train_flat.shape[1]
+    q_dim = q_train_flat.shape[1]
+
     nn_config = {
         "state_dim": s_dim,
-        "h_width": 128, "h_depth": 3, "h_epsilon": 0.525,
-        "d_width": 2, "d_depth": 3,
-        "j_width": 2, "j_depth": 3,
-        "activation": jax.nn.softplus,
+        "q_dim": q_dim,
+        "state_nn": {
+            "width": 128,
+            "depth": 3,
+            "activation": jax.nn.tanh,
+            "fourier_features": {
+                "mapping_size": 32,
+                "scale": 300,
+            }
+        },
+        "hamiltonian_nn": {
+            "hidden_size": 64,
+            "ficnn": {
+                "width": 128,
+                "depth": 3,
+                "activation": jax.nn.softplus,
+            }
+        },
+        "dissipation_nn": {
+            "hidden_size": 32,
+            "width": 8,
+            "depth": 3,
+            "activation": jax.nn.softplus,
+        },
+        "j_net": {
+            "hidden_size": 32,
+            "width": 8,
+            "depth": 3,
+            "activation": jax.nn.softplus,
+        }
     }
 
     # Initialize the combined model
     model = Combined_sPHNN_PINN(key=model_key, config=nn_config)
 
-    # --- Training Loop ---
+    # --- Training Loop (omitted for brevity, no changes) ---
     lr_schedule = optax.linear_schedule(
         init_value=initial_learning_rate,
         end_value=end_learning_rate,
@@ -573,7 +746,7 @@ def main():
 
     num_batches = t_train_norm.shape[0] // batch_size
     if num_batches == 0 and t_train_norm.shape[0] > 0:
-        print(f"Warning: batch_size ({batch_size}) > num samples. Setting num_batches to 1.")
+        print(f"Warning: batch_size ({batch_size}) > num_windows. Setting num_batches to 1.")
         num_batches = 1
 
     print(f"Starting training for {epochs} epochs...")
@@ -586,18 +759,17 @@ def main():
 
         key, shuffle_key = jax.random.split(key)
         perm = jax.random.permutation(shuffle_key, t_train_norm.shape[0])
-        t_shuffled = t_train_norm[perm]
-        s_shuffled = s_train_norm[perm]
-        q_shuffled = q_train_norm[perm]
-        s_dot_shuffled = s_dot_train_norm[perm]
-        H_shuffled = H_train_norm[perm]
+        t_shuffled, s_shuffled, q_shuffled, s_dot_shuffled, H_shuffled = \
+            t_train_norm[perm], s_train_norm[perm], q_train_norm[perm], s_dot_train_norm[perm], H_train_norm[perm]
 
-        # Initialize epoch loss accumulators
         epoch_losses = {k: 0.0 for k in ["total", "data_unified", "phys", "conservative", "dissipative", "hamiltonian"]}
 
         for i in range(num_batches):
             start, end = i * batch_size, (i + 1) * batch_size
-            t_b, s_b, q_b, s_dot_b, H_b = t_shuffled[start:end], s_shuffled[start:end], q_shuffled[start:end], s_dot_shuffled[start:end], H_shuffled[start:end]
+            t_b, s_b, q_b, s_dot_b, H_b = t_shuffled[start:end], s_shuffled[start:end], q_shuffled[
+                                                                                        start:end], s_dot_shuffled[
+                                                                                                    start:end], H_shuffled[
+                                                                                                                start:end]
 
             model, opt_state, train_loss_val, loss_comps = train_step(
                 model, opt_state, optimizer, t_b, s_b, q_b, s_dot_b, H_b,
@@ -608,7 +780,6 @@ def main():
                 if k in loss_comps:
                     epoch_losses[k] += loss_comps[k]
 
-        # Calculate average losses for the epoch
         avg_losses = {k: v / num_batches for k, v in epoch_losses.items()}
 
         val_loss = evaluate_model(
@@ -624,14 +795,13 @@ def main():
         dissipative_losses.append(avg_losses["dissipative"])
         hamiltonian_losses.append(avg_losses["hamiltonian"])
 
-        '''if val_loss < best_val_loss:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model = model'''
-        best_model = model
+            best_model = model
 
         if (epoch + 1) % 100 == 0 or epoch == 0:
             log_str = (
-                f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_losses['total']:.4f} | Val Loss: {val_loss:.4f} | "
+                f"Epoch {epoch + 1}/{epochs} | Train Loss: {avg_losses['total']:.4f} | Val Loss: {val_loss:.4f} | "
                 f"Data: {avg_losses['data_unified']:.4f} | "
                 f"Phys: {avg_losses['phys']:.4f} | "
                 f"Cons: {avg_losses['conservative']:.4f} | Diss: {avg_losses['dissipative']:.4f} | "
@@ -639,11 +809,9 @@ def main():
             )
             print(log_str)
 
-
     print("Training finished.")
     print(f"Best validation loss achieved: {best_val_loss:.6f}")
 
-    #%%
     # ==============================================================================
     # 5. VISUALIZATION AND ANALYSIS
     # ==============================================================================
@@ -651,41 +819,29 @@ def main():
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'results', 'temp/')
     os.makedirs(output_dir, exist_ok=True)
 
-    run_to_visualize_idx = 0 # <-- CHOOSE WHICH SIMULATION RUN TO PLOT
+    run_to_visualize_idx = 0
 
     print(f"\nGenerating visualization plots for simulation run #{run_to_visualize_idx + 1}...")
 
-    # Load the data again to isolate a single run for clean plotting
     with open(path, 'rb') as f:
         all_runs = pickle.load(f)
-
-    # Ensure the chosen index is valid
     if run_to_visualize_idx >= len(all_runs):
-        print(f"Error: 'run_to_visualize_idx' ({run_to_visualize_idx}) is out of bounds. Max is {len(all_runs)-1}. Setting to 0.")
+        print(f"Error: 'run_to_visualize_idx' is out of bounds. Setting to 0.")
         run_to_visualize_idx = 0
-
     vis_results = all_runs[run_to_visualize_idx]
 
-    # Use the selected run's data for all subsequent plotting
     t_test = jnp.asarray(vis_results['t']).reshape(-1, 1)
-    s_test = jnp.vstack([
-        vis_results['e_x'], vis_results['e_y'], vis_results['e_z'],
-        vis_results['e_u'], vis_results['e_phi']
-    ]).T
-    q_test = jnp.vstack([
-        vis_results['x1'], vis_results['y1'], vis_results['z1'], vis_results['u1'], vis_results['phi1'],
-        vis_results['x2'], vis_results['y2'], vis_results['z2'], vis_results['u2'], vis_results['phi2']
-    ]).T
-    s_dot_test = jnp.vstack([
-        vis_results['d_e_x'], vis_results['d_e_y'], vis_results['d_e_z'],
-        vis_results['d_e_u'], vis_results['d_e_phi']
-    ]).T
+    s_test = jnp.vstack(
+        [vis_results['e_x'], vis_results['e_y'], vis_results['e_z'], vis_results['e_u'], vis_results['e_phi']]).T
+    q_test = jnp.vstack(
+        [vis_results['x1'], vis_results['y1'], vis_results['z1'], vis_results['u1'], vis_results['phi1'],
+         vis_results['x2'], vis_results['y2'], vis_results['z2'], vis_results['u2'], vis_results['phi2']]).T
+    s_dot_test = jnp.vstack([vis_results['d_e_x'], vis_results['d_e_y'], vis_results['d_e_z'], vis_results['d_e_u'],
+                             vis_results['d_e_phi']]).T
     H_analytical_vis = jnp.asarray(vis_results['Hamiltonian'])
 
-    # Normalize the visualization data using the previously computed training statistics
     t_test_norm = normalize(t_test, t_mean, t_std)
 
-    # --- Get all model predictions for the full dataset ---
     all_states_pred_norm = jax.vmap(best_model.state_net)(t_test_norm)
     q_pred_norm = all_states_pred_norm[:, :10]
     s_pred_norm = all_states_pred_norm[:, 10:]
@@ -693,10 +849,15 @@ def main():
     s_pred = denormalize(s_pred_norm, s_mean, s_std)
     q_pred = denormalize(q_pred_norm, q_mean, q_std)
 
-    # --- Calculate all derivatives for comparison ---
-    grad_H_norm = jax.vmap(jax.grad(best_model.hamiltonian_net))(s_pred_norm)
-    J_norm = jax.vmap(best_model.j_net)(s_pred_norm)
-    R_norm = jax.vmap(best_model.dissipation_net)(s_pred_norm)
+    # --- Create windows for the test data to feed into LSTM models ---
+    (s_pred_norm_windows,) = create_windows(window_size, s_pred_norm)
+
+    grad_H_norm_windows = jax.vmap(jax.grad(best_model.hamiltonian_net))(s_pred_norm_windows)
+    grad_H_norm = grad_H_norm_windows[:, -1, :] # Take last gradient
+    J_norm = jax.vmap(best_model.j_net)(s_pred_norm_windows)
+    R_norm = jax.vmap(best_model.dissipation_net)(s_pred_norm_windows)
+    
+    # We only have predictions for the end of each window, so we align them with the original time axis.
     s_dot_from_structure_norm = jax.vmap(lambda j, r, g: (j - r) @ g)(J_norm, R_norm, grad_H_norm)
     s_dot_from_structure = s_dot_from_structure_norm * s_std
 
@@ -704,21 +865,28 @@ def main():
     f_d_batch_vis = jax.vmap(f_d_fn, in_axes=(0, 0, None))(s_pred, q_pred, hr_params)
     s_dot_from_equations = f_c_batch_vis + f_d_batch_vis
 
-    # Need to compute autodiff for the s-slice of the StateNN's output
-    get_s_slice_autodiff_grad = lambda net, t: jax.jvp(lambda t_scalar: net(t_scalar)[10:], (t,), (jnp.ones_like(t),))[1]
+    get_s_slice_autodiff_grad = lambda net, t: jax.jvp(lambda t_scalar: net(t_scalar)[10:], (t,), (jnp.ones_like(t),))[
+        1]
     s_dot_autodiff_norm = jax.vmap(get_s_slice_autodiff_grad, in_axes=(None, 0))(best_model.state_net, t_test_norm)
     s_dot_autodiff = s_dot_autodiff_norm * (s_std / (t_std + 1e-8))
 
-
-    # --- Plot 1: Learned vs Analytical Hamiltonian ---
     print("Comparing learned Hamiltonian with analytical solution...")
-    H_learned_norm = jax.vmap(best_model.hamiltonian_net)(s_pred_norm)
-    H_learned_flipped = (-1) * H_learned_norm
-    H_learned_aligned = H_learned_flipped - jnp.mean(H_learned_flipped) + jnp.mean(H_analytical_vis)
+    H_learned_norm = jax.vmap(best_model.hamiltonian_net)(s_pred_norm_windows)
+    H_learned_aligned = denormalize(H_learned_norm, H_mean, H_std)
+    
+    # Align the length of analytical H with the windowed predictions
+    H_analytical_vis_aligned = H_analytical_vis[window_size - 1:]
+    
+    correlation = jnp.corrcoef(H_analytical_vis_aligned.flatten(), H_learned_aligned.flatten())[0, 1]
+    sign = jnp.sign(correlation if not jnp.isnan(correlation) else 1.0)
+    H_learned_aligned = sign * H_learned_aligned - jnp.mean(sign * H_learned_aligned) + jnp.mean(H_analytical_vis_aligned)
+    
+    # Adjust time axis for windowed predictions
+    t_test_windowed = t_test[window_size-1:]
 
     plt.figure(figsize=(12, 7))
-    plt.plot(t_test[:1500], H_analytical_vis[:1500], label='Analytical Hamiltonian', color='blue')
-    plt.plot(t_test[:1500], H_learned_aligned[:1500], label='Learned Hamiltonian (Aligned)', color='red')
+    plt.plot(t_test[:2000], H_analytical_vis[:2000], label='Analytical Hamiltonian', color='blue')
+    plt.plot(t_test_windowed[:2000], H_learned_aligned[:2000], label='Learned Hamiltonian (Aligned)', color='red', linestyle='--')
     plt.title("Time Evolution of Hamiltonians", fontsize=16)
     plt.xlabel("Time", fontsize=14)
     plt.ylabel("Hamiltonian Value", fontsize=14)
@@ -727,8 +895,6 @@ def main():
     plt.savefig(os.path.join(output_dir, 'hamiltonian_comparison.png'), dpi=300)
     plt.tight_layout()
 
-
-    # --- Plot 2: Training, Validation, and Physics Losses ---
     plt.figure(figsize=(12, 7))
     plt.plot(train_losses, label='Total Training Loss')
     plt.plot(val_losses, label='Total Validation Loss')
@@ -745,32 +911,28 @@ def main():
     plt.savefig(os.path.join(output_dir, 'training_losses.png'), dpi=300)
     plt.tight_layout()
 
-    # --- Plot 3: Derivative Comparison (Physics Fidelity) ---
     fig, axes = plt.subplots(s_test.shape[1], 1, figsize=(12, 12), sharex=True)
     state_labels_s_dot = [r'$\dot{e}_x$', r'$\dot{e}_y$', r'$\dot{e}_z$', r'$\dot{e}_u$', r'$\dot{e}_\phi$']
     fig.suptitle("Derivative Fidelity Comparison", fontsize=18, y=0.99)
-
     for i in range(s_test.shape[1]):
-        axes[i].plot(t_test[:1500], s_dot_test[:1500, i], label='True Derivative', color='green', linewidth=3, alpha=0.8)
-        axes[i].plot(t_test[:1500], s_dot_from_structure[:1500, i], label='sPHNN Structure', color='red')
-        axes[i].plot(t_test[:1500], s_dot_from_equations[:1500, i], label='Analytical Eq. (f_c+f_d)', color='purple')
-        axes[i].plot(t_test[:1500], s_dot_autodiff[:1500, i], label='Autodiff', color='orange')
-
+        axes[i].plot(t_test[:2000], s_dot_test[:2000, i], label='True Derivative', color='green', linewidth=3, alpha=0.8)
+        axes[i].plot(t_test_windowed[:2000], s_dot_from_structure[:2000, i], label='sPHNN Structure', color='red', linestyle='--')
+        axes[i].plot(t_test[:2000], s_dot_from_equations[:2000, i], label='Analytical Eq. (f_c+f_d)', color='purple',
+                     linestyle=':')
+        axes[i].plot(t_test[:2000], s_dot_autodiff[:2000, i], label='Autodiff', color='orange', linestyle='-.')
         axes[i].set_ylabel(state_labels_s_dot[i], fontsize=14)
         axes[i].grid(True)
         axes[i].legend(loc='upper right')
-
     axes[-1].set_xlabel("Time", fontsize=14)
     fig.savefig(os.path.join(output_dir, 'derivative_fidelity.png'), dpi=300)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
-    # --- Plot 4: Error System State Trajectories (s) ---
     fig, axes = plt.subplots(s_test.shape[1], 1, figsize=(12, 10), sharex=True)
     state_labels_error = [r'$e_x$', r'$e_y$', r'$e_z$', r'$e_u$', r'$e_\phi$']
     fig.suptitle("Error System State 's' Prediction: True vs. Predicted", fontsize=18, y=0.99)
     for i in range(s_test.shape[1]):
-        axes[i].plot(t_test[:1500], s_test[:1500, i], 'b', label='True State', alpha=0.9)
-        axes[i].plot(t_test[:1500], s_pred[:1500, i], 'r', label='Predicted State')
+        axes[i].plot(t_test[:2000], s_test[:2000, i], 'b', label='True State', alpha=0.9)
+        axes[i].plot(t_test[:2000], s_pred[:2000, i], 'r--', label='Predicted State')
         axes[i].set_ylabel(state_labels_error[i], fontsize=14)
         axes[i].grid(True)
         axes[i].legend(loc='upper right')
@@ -778,16 +940,13 @@ def main():
     fig.savefig(os.path.join(output_dir, 'error_state_s_prediction.png'), dpi=300)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
-    # --- Plot 5: HR System State Trajectories (q) ---
     fig, axes = plt.subplots(q_test.shape[1], 1, figsize=(12, 18), sharex=True)
-    state_labels_q = [
-        r'$x_1$', r'$y_1$', r'$z_1$', r'$u_1$', r'$\phi_1$',
-        r'$x_2$', r'$y_2$', r'$z_2$', r'$u_2$', r'$\phi_2$'
-    ]
+    state_labels_q = [r'$x_1$', r'$y_1$', r'$z_1$', r'$u_1$', r'$\phi_1$', r'$x_2$', r'$y_2$', r'$z_2$', r'$u_2$',
+                      r'$\phi_2$']
     fig.suptitle("HR System State 'q' Prediction: True vs. Predicted", fontsize=18, y=0.99)
     for i in range(q_test.shape[1]):
-        axes[i].plot(t_test[:1500], q_test[:1500, i], 'b', label='True State', alpha=0.9)
-        axes[i].plot(t_test[:1500], q_pred[:1500, i], 'r', label='Predicted State')
+        axes[i].plot(t_test[:2000], q_test[:2000, i], 'b', label='True State', alpha=0.9)
+        axes[i].plot(t_test[:2000], q_pred[:2000, i], 'r--', label='Predicted State')
         axes[i].set_ylabel(state_labels_q[i], fontsize=14)
         axes[i].grid(True)
         axes[i].legend(loc='upper right')

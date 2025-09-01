@@ -3,16 +3,13 @@ optimize_hyperparams.py
 -----------------------
 This script uses the Optuna framework to perform an automated hyperparameter
 search for the Combined_sPHNN_PINN model defined in pH_PINN.py.
-
 It defines an "objective" function that Optuna repeatedly calls with different
 hyperparameter combinations. Each call (a "trial") trains the model for a
-fixed number of epochs and returns the best validation loss. Optuna uses
-these results to intelligently search for the optimal set of hyperparameters.
-
+fixed number of epochs and returns the best training Hamiltonian loss.
+Optuna uses these results to intelligently search for the optimal set of hyperparameters.
 Results of the study are saved to a SQLite database file (optimize_hyperparams.db)
 in the 'results/PINN Data/' directory, allowing the optimization to be paused
 and resumed.
-
 To run this script:
 1. Make sure you have Optuna and its storage dependencies installed:
    pip install optuna
@@ -32,8 +29,6 @@ import optax
 import optuna
 
 # Ensure the script can find other modules in the project
-# This adds the project's root directory to the Python path.
-# Assumes the script is run from the root directory as recommended.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 # --- Import necessary components from your existing files ---
@@ -42,7 +37,7 @@ from src.sph_pinn.pH_PINN import (
     StateNN, HamiltonianNN, DissipationNN, DynamicJ_NN, # Import component networks
     generate_data,
     normalize,
-    denormalize,
+    create_windows, # Import windowing function
     train_step,
     evaluate_model,
 )
@@ -54,8 +49,8 @@ jax.config.update("jax_enable_x64", True)
 # 1. LOCAL MODEL DEFINITION FOR HYPERPARAMETER FLEXIBILITY
 # ==============================================================================
 
-# We redefine the combined model here to easily pass architectural hyperparameters
-# from the Optuna trial into the sub-networks.
+# We redefine the combined model here to match the new architecture in pH_PINN.py
+# and to easily pass hyperparameters from the Optuna trial.
 class Combined_sPHNN_PINN(eqx.Module):
     """Main model combining a unified state predictor and sPHNN structure."""
     state_net: StateNN
@@ -65,29 +60,45 @@ class Combined_sPHNN_PINN(eqx.Module):
 
     def __init__(self, key, config):
         state_key, h_key, d_key, j_key = jax.random.split(key, 4)
-        state_dim = config['state_dim']
-        x0_norm = jnp.zeros(state_dim)
 
-        # Use hyperparameters from config for all networks
+        state_dim = config['state_dim']
+        q_dim = config['q_dim']
+
+        # Unpack configs for clarity
+        cfg_state = config['state_nn']
+        cfg_h = config['hamiltonian_nn']
+        cfg_d = config['dissipation_nn']
+        cfg_j = config['j_net']
+
         self.state_net = StateNN(
             key=state_key,
-            out_size=config['q_dim'] + state_dim,
-            width=config['state_width'],
-            depth=config['state_depth'],
-            mapping_size=config['mapping_size'],
-            scale=config['scale']
+            out_size=state_dim + q_dim,
+            width=cfg_state['width'],
+            depth=cfg_state['depth'],
+            activation=cfg_state['activation'],
+            mapping_size=cfg_state['fourier_features']['mapping_size'],
+            scale=cfg_state['fourier_features']['scale']
         )
         self.hamiltonian_net = HamiltonianNN(
-            h_key, in_size=state_dim, width=config['h_width'], depth=config['h_depth'],
-            x0=x0_norm, epsilon=config['h_epsilon']
+            h_key, state_dim=state_dim,
+            hidden_size=cfg_h['hidden_size'],
+            ficnn_width=cfg_h['ficnn']['width'],
+            ficnn_depth=cfg_h['ficnn']['depth'],
+            ficnn_activation=cfg_h['ficnn']['activation']
         )
         self.dissipation_net = DissipationNN(
-            d_key, state_dim=state_dim, width=config['d_width'],
-            depth=config['d_depth'], activation=config['activation']
+            d_key, state_dim=state_dim,
+            hidden_size=cfg_d['hidden_size'],
+            width=cfg_d['width'],
+            depth=cfg_d['depth'],
+            activation=cfg_d['activation']
         )
         self.j_net = DynamicJ_NN(
-            j_key, state_dim=state_dim, width=config['j_width'],
-            depth=config['j_depth'], activation=config['activation']
+            j_key, state_dim=state_dim,
+            hidden_size=cfg_j['hidden_size'],
+            width=cfg_j['width'],
+            depth=cfg_j['depth'],
+            activation=cfg_j['activation']
         )
 
 # ==============================================================================
@@ -100,7 +111,7 @@ def objective(trial, epochs_per_trial, static_data):
     Args:
         trial (optuna.Trial): An Optuna trial object used to suggest hyperparameters.
         epochs_per_trial (int): The number of epochs to train for during each trial.
-        static_data (dict): A dictionary containing all pre-processed data and stats.
+        static_data (dict): A dictionary containing all pre-processed UN-WINDOWED data and stats.
     Returns:
         float: The best training Hamiltonian loss achieved during the trial.
     """
@@ -108,42 +119,68 @@ def objective(trial, epochs_per_trial, static_data):
     key = jax.random.PRNGKey(42)  # Use a fixed key for reproducibility across trials
     model_key, _ = jax.random.split(key)
 
-    # StateNN Fourier Features
-    mapping_size = trial.suggest_int("mapping_size", 64, 512, step=2)  # Enforce even numbers
-    scale = trial.suggest_float("scale", 10, 1000, log=True)
+    # Data pre-processing
+    window_size = trial.suggest_int("window_size", 32, 128)
 
-    # Network Architectures
-    state_width = trial.suggest_int("state_width", 64, 1024)
+    # StateNN Fourier Features & Architecture
+    mapping_size = trial.suggest_int("mapping_size", 32, 128)
+    scale = trial.suggest_float("scale", 10, 500, log=True)
+    state_width = trial.suggest_int("state_width", 8, 512)
     state_depth = trial.suggest_int("state_depth", 2, 6)
-    h_width = trial.suggest_int("h_width", 32, 512)
-    h_depth = trial.suggest_int("h_depth", 2, 6)
+    state_activation_name = trial.suggest_categorical("state_activation", ["tanh", "softplus"])
+    state_activation = getattr(jax.nn, state_activation_name)
+
+    # HamiltonianNN (LSTM + FICNN)
+    h_hidden_size = trial.suggest_int("h_hidden_size", 8, 512)
+    h_ficnn_width = trial.suggest_int("h_ficnn_width", 8, 512)
+    h_ficnn_depth = trial.suggest_int("h_ficnn_depth", 2, 6)
+
+    # DissipationNN and J_NN (LSTMs + MLPs)
+    jr_hidden_size = trial.suggest_int("jr_hidden_size", 16, 64)
     d_width = trial.suggest_int("d_width", 4, 64)
     d_depth = trial.suggest_int("d_depth", 2, 6)
     j_width = trial.suggest_int("j_width", 4, 64)
     j_depth = trial.suggest_int("j_depth", 2, 6)
-    h_epsilon = trial.suggest_float("h_epsilon", 0.01, 5)
 
     # Optimizer
     lr_initial = trial.suggest_float("lr_initial", 1e-4, 1e-2, log=True)
-    decay_steps = trial.suggest_int("decay_steps", 100, 2000)
+    decay_steps = trial.suggest_int("decay_steps", 500, 4000)
 
     # Training and Loss
-    batch_size = trial.suggest_int("batch_size", 100, 4000)
-    lambda_conservative_max = trial.suggest_float("lambda_conservative_max", 0.1, 10, log=True)
-    lambda_dissipative_max = trial.suggest_float("lambda_dissipative_max", 0.1, 10, log=True)
-    lambda_physics_max = trial.suggest_float("lambda_physics_max", 0.1, 10, log=True)
-    lambda_warmup_epochs = trial.suggest_int("lambda_warmup_epochs", 500, 2000)
+    batch_size = trial.suggest_categorical("batch_size", [1024, 2048])
+    lambda_conservative_max = trial.suggest_float("lambda_conservative_max", 0.1, 20, log=True)
+    lambda_dissipative_max = trial.suggest_float("lambda_dissipative_max", 0.1, 20, log=True)
+    lambda_physics_max = trial.suggest_float("lambda_physics_max", 0.1, 20, log=True)
+    lambda_warmup_epochs = trial.suggest_int("lambda_warmup_epochs", 500, 3000)
 
-    # --- 2. Build Model and Optimizer with Suggested Values ---
+    # --- 2. Create Windowed Data for this Trial ---
+    (t_train_w, s_train_w, q_train_w, s_dot_train_w, H_train_w) = create_windows(
+        window_size, static_data['t_train_norm'], static_data['s_train_norm'], static_data['q_train_norm'],
+        static_data['s_dot_train_norm'], static_data['H_train_norm']
+    )
+    (t_val_w, s_val_w, q_val_w, s_dot_val_w, H_val_w) = create_windows(
+        window_size, static_data['t_val_norm'], static_data['s_val_norm'], static_data['q_val_norm'],
+        static_data['s_dot_val_norm'], static_data['H_val_norm']
+    )
+
+    # --- 3. Build Model and Optimizer with Suggested Values ---
     nn_config = {
         "state_dim": static_data['s_dim'],
         "q_dim": static_data['q_dim'],
-        "state_width": state_width, "state_depth": state_depth,
-        "mapping_size": mapping_size, "scale": scale,
-        "h_width": h_width, "h_depth": h_depth, "h_epsilon": h_epsilon,
-        "d_width": d_width, "d_depth": d_depth,
-        "j_width": j_width, "j_depth": j_depth,
-        "activation": jax.nn.softplus,
+        "state_nn": {
+            "width": state_width, "depth": state_depth, "activation": state_activation,
+            "fourier_features": {"mapping_size": mapping_size, "scale": scale}
+        },
+        "hamiltonian_nn": {
+            "hidden_size": h_hidden_size,
+            "ficnn": {"width": h_ficnn_width, "depth": h_ficnn_depth, "activation": jax.nn.softplus}
+        },
+        "dissipation_nn": {
+            "hidden_size": jr_hidden_size, "width": d_width, "depth": d_depth, "activation": jax.nn.softplus
+        },
+        "j_net": {
+            "hidden_size": jr_hidden_size, "width": j_width, "depth": j_depth, "activation": jax.nn.softplus
+        }
     }
     model = Combined_sPHNN_PINN(key=model_key, config=nn_config)
 
@@ -153,9 +190,9 @@ def objective(trial, epochs_per_trial, static_data):
     optimizer = optax.adamw(learning_rate=lr_schedule)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    # --- 3. Run the Training Loop and Track Training Hamiltonian Loss ---
+    # --- 4. Run the Training Loop ---
     best_training_hamiltonian_loss = jnp.inf
-    num_batches = static_data['t_train_norm'].shape[0] // batch_size
+    num_batches = t_train_w.shape[0] // batch_size
     if num_batches == 0:
         num_batches = 1
 
@@ -166,11 +203,9 @@ def objective(trial, epochs_per_trial, static_data):
         current_lambda_physics = lambda_physics_max * warmup_factor
 
         key, shuffle_key = jax.random.split(key)
-        perm = jax.random.permutation(shuffle_key, static_data['t_train_norm'].shape[0])
+        perm = jax.random.permutation(shuffle_key, t_train_w.shape[0])
         t_shuffled, s_shuffled, q_shuffled, s_dot_shuffled, H_shuffled = (
-            static_data['t_train_norm'][perm], static_data['s_train_norm'][perm],
-            static_data['q_train_norm'][perm], static_data['s_dot_train_norm'][perm],
-            static_data['H_train_norm'][perm]
+            t_train_w[perm], s_train_w[perm], q_train_w[perm], s_dot_train_w[perm], H_train_w[perm]
         )
 
         epoch_hamiltonian_loss = 0.0
@@ -180,7 +215,6 @@ def objective(trial, epochs_per_trial, static_data):
                 t_shuffled[start:end], s_shuffled[start:end], q_shuffled[start:end],
                 s_dot_shuffled[start:end], H_shuffled[start:end]
             )
-            # The train_step function returns the model, optimizer state, total loss, and a dictionary of loss components
             model, opt_state, _, loss_components = train_step(
                 model, opt_state, optimizer, t_b, s_b, q_b, s_dot_b, H_b,
                 current_lambda_conservative, current_lambda_dissipative, current_lambda_physics,
@@ -189,17 +223,14 @@ def objective(trial, epochs_per_trial, static_data):
                 static_data['q_std'], static_data['s_dot_mean'], static_data['s_dot_std'],
                 static_data['H_mean'], static_data['H_std']
             )
-            # Accumulate the Hamiltonian loss from the training batch
             epoch_hamiltonian_loss += loss_components['hamiltonian']
 
-        # Calculate the average training Hamiltonian loss for the epoch
         avg_epoch_hamiltonian_loss = epoch_hamiltonian_loss / num_batches
 
-        # Update the best training Hamiltonian loss if the current one is better
         if avg_epoch_hamiltonian_loss < best_training_hamiltonian_loss:
             best_training_hamiltonian_loss = avg_epoch_hamiltonian_loss
 
-    # --- 4. Return the Final Metric to Optuna ---
+    # --- 5. Return the Final Metric to Optuna ---
     return best_training_hamiltonian_loss
 
 
@@ -258,17 +289,16 @@ if __name__ == "__main__":
     # --- 2. Create and Run the Optuna Study ---
     print("\nStarting Optuna hyperparameter search...")
 
-    # Define the storage directory and ensure it exists
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'results', 'PINN Data')
     os.makedirs(results_dir, exist_ok=True)
 
-    # Define the full path for the database file
     db_name = os.path.basename(__file__).replace('.py', '.db')
     db_path = os.path.join(results_dir, db_name)
 
     storage_name = f"sqlite:///{db_path}"
-    study_name = "sphnn_pinn_optimization_study"
+    study_name = "sphnn_pinn_optimization_study_v2" # New study name for new architecture
 
+    # Use a lambda to pass static arguments to the objective function
     objective_with_args = lambda trial: objective(trial, epochs_per_trial=500, static_data=static_data)
 
     study = optuna.create_study(
@@ -276,9 +306,9 @@ if __name__ == "__main__":
         storage=storage_name,
         direction="minimize",
         load_if_exists=True
-        )
+    )
 
-    study.optimize(objective_with_args, n_trials=30)
+    study.optimize(objective_with_args, n_trials=50) # Increased trials for larger search space
 
     # --- 3. Print and Save the Results ---
     print("\nOptimization finished.")
@@ -288,17 +318,16 @@ if __name__ == "__main__":
     best_trial = study.best_trial
 
     print("Best trial:")
-    print(f"  Value (Best Validation Loss): {best_trial.value:.6f}")
+    print(f"  Value (Best Training Hamiltonian Loss): {best_trial.value:.6f}")
     print("  Best Hyperparameters: ")
     for key, value in best_trial.params.items():
         print(f"    {key}: {value}")
 
-    # Save the best hyperparameters to a text file
-    output_txt_path = os.path.join(results_dir, "best_hyperparams.txt")
+    output_txt_path = os.path.join(results_dir, "best_hyperparams_v2.txt")
     with open(output_txt_path, 'w') as f:
-        f.write("Best Hyperparameter Optimization Results\n")
-        f.write("========================================\n\n")
-        f.write(f"Best Value (Validation Loss): {best_trial.value}\n\n")
+        f.write("Best Hyperparameter Optimization Results (v2 Architecture)\n")
+        f.write("========================================================\n\n")
+        f.write(f"Best Value (Training Hamiltonian Loss): {best_trial.value}\n\n")
         f.write("Best Hyperparameters:\n")
         for key, value in best_trial.params.items():
             f.write(f"    {key}: {value}\n")
